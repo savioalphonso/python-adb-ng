@@ -6,8 +6,23 @@ except ImportError:  # pragma: no cover
 import re
 import os
 
+from ppadb import InstallError
+
+from ppadb.plugins.device_async.input import Input
+from ppadb.plugins.device_async.utils import Utils
+from ppadb.plugins.device_async.wm import WM
+from ppadb.plugins.device_async.traffic import Traffic
+from ppadb.plugins.device_async.cpustat import CPUStat
+from ppadb.plugins.device_async.batterystats import BatteryStats
+from ppadb.command.serial_async import Serial
 from ppadb.command.transport_async import TransportAsync
 from ppadb.sync_async import SyncAsync
+from ppadb.utils import logger
+
+try:
+    from shlex import quote as cmd_quote
+except ImportError:
+    from pipes import quote as cmd_quote
 
 
 def _get_src_info(src):
@@ -20,7 +35,7 @@ def _get_src_info(src):
     return exists, isfile, isdir, basename, walk
 
 
-class DeviceAsync(TransportAsync):
+class DeviceAsync(TransportAsync, Serial, Input, Utils, WM, Traffic, CPUStat, BatteryStats):
     INSTALL_RESULT_PATTERN = "(Success|Failure|Error)\s?(.*)"
     UNINSTALL_RESULT_PATTERN = "(Success|Failure.*|.*Unknown package:.*)"
 
@@ -67,3 +82,63 @@ class DeviceAsync(TransportAsync):
 
         async with sync_conn:
             return await sync.pull(src, dest)
+
+    async def install(self, path,
+                forward_lock=False,  # -l
+                reinstall=False,  # -r
+                test=False,  # -t
+                installer_package_name="",  # -i {installer_package_name}
+                shared_mass_storage=False,  # -s
+                internal_system_memory=False,  # -f
+                downgrade=False,  # -d
+                grant_all_permissions=False  # -g
+                ):
+        
+        dest = SyncAsync.temp(path)
+        self.push(path, dest)
+
+        parameters = []
+        if forward_lock: parameters.append("-l")
+        if reinstall: parameters.append("-r")
+        if test: parameters.append("-t")
+        if len(installer_package_name) > 0: parameters.append("-i {}".format(installer_package_name))
+        if shared_mass_storage: parameters.append("-s")
+        if internal_system_memory: parameters.append("-f")
+        if downgrade: parameters.append("-d")
+        if grant_all_permissions: parameters.append("-g")
+
+        try:
+            result = await self.shell("pm install {} {}".format(" ".join(parameters), cmd_quote(dest)))
+            match = re.search(self.INSTALL_RESULT_PATTERN, result)
+
+            if match and match.group(1) == "Success":
+                return True
+            elif match:
+                groups = match.groups()
+                raise InstallError(dest, groups[1])
+            else:
+                raise InstallError(dest, result)
+        finally:
+            self.shell("rm -f {}".format(dest))
+    
+    async def is_installed(self, package):
+        result = await self.shell('pm path {}'.format(package))
+
+        if "package:" in result:
+            return True
+        else:
+            return False
+
+    async def uninstall(self, package):
+        result = await self.shell('pm uninstall {}'.format(package))
+
+        m = re.search(self.UNINSTALL_RESULT_PATTERN, result)
+
+        if m and m.group(1) == "Success":
+            return True
+        elif m:
+            logger.error(m.group(1))
+            return False
+        else:
+            logger.error("There is no message after uninstalling")
+            return False
